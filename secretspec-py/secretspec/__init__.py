@@ -139,6 +139,7 @@ class SecretReport:
     status: str  # "resolved" | "missing_required" | "missing_optional"
     required: bool
     source_provider: Optional[str]
+    issuable: bool  # 0.18+: provider can issue without report-time materialization
     default_applied: bool
     generated: bool
     as_path: bool
@@ -323,6 +324,7 @@ class _Builder:
                 status=s["status"],
                 required=s.get("required", False),
                 source_provider=s.get("source_provider"),
+                issuable=s.get("issuable", False),
                 default_applied=s.get("default_applied", False),
                 generated=s.get("generated", False),
                 as_path=s.get("as_path", False),

@@ -74,9 +74,10 @@ use crate::{Result, SecretSpecError};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, percent_encode};
 use secrecy::{ExposeSecret, SecretString};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::SystemTime;
 use url::Url;
 
 /// Credentials handed to a provider at construction.
@@ -414,6 +415,224 @@ impl<'a> Address<'a> {
     }
 }
 
+/// Lifecycle of one resource issued by a provider. Available since SecretSpec
+/// 0.18.
+///
+/// This is deliberately provider-neutral: a database credential, cloud access
+/// token, or certificate can all expire, while only some backends expose a
+/// renewable lease. Provider-internal identifiers such as a Vault/OpenBao
+/// lease ID are not part of the resolver contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderResourceLifecycle {
+    /// The resource becomes invalid at a known time and cannot be renewed
+    /// through the provider contract.
+    Expiring { expires_at: SystemTime },
+    /// The resource is governed by a backend lease.
+    Leased {
+        expires_at: SystemTime,
+        renewable: bool,
+    },
+}
+
+impl ProviderResourceLifecycle {
+    /// When the issued resource stops being valid unless renewed.
+    pub fn expires_at(&self) -> SystemTime {
+        match self {
+            Self::Expiring { expires_at } | Self::Leased { expires_at, .. } => *expires_at,
+        }
+    }
+}
+
+/// Secret names produced atomically from one issued provider resource.
+/// Available since SecretSpec 0.18.
+///
+/// For example, a database credentials endpoint may issue `DB_USERNAME` and
+/// `DB_PASSWORD` together. Keeping those names in one resource prevents the
+/// resolver from treating independently fetched generations as one credential
+/// pair. Values that are not members of a resource retain the ordinary stored
+/// secret behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderResource {
+    members: Vec<String>,
+    lifecycle: ProviderResourceLifecycle,
+}
+
+impl ProviderResource {
+    /// Describes one atomically issued resource.
+    pub fn new(
+        members: impl IntoIterator<Item = impl Into<String>>,
+        lifecycle: ProviderResourceLifecycle,
+    ) -> Result<Self> {
+        let members: Vec<String> = members.into_iter().map(Into::into).collect();
+        if members.is_empty() {
+            return Err(SecretSpecError::ProviderOperationFailed(
+                "an issued provider resource must contain at least one secret".to_string(),
+            ));
+        }
+        let mut unique = HashSet::new();
+        if let Some(duplicate) = members
+            .iter()
+            .find(|member| !unique.insert(member.as_str()))
+        {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "issued provider resource contains duplicate secret '{duplicate}'"
+            )));
+        }
+        Ok(Self { members, lifecycle })
+    }
+
+    /// SecretSpec names populated by this resource.
+    pub fn members(&self) -> &[String] {
+        &self.members
+    }
+
+    /// Expiry and lease behavior reported by the provider.
+    pub fn lifecycle(&self) -> ProviderResourceLifecycle {
+        self.lifecycle
+    }
+}
+
+/// Result of a materializing provider batch fetch. Available since SecretSpec
+/// 0.18.
+///
+/// Existing stored-secret providers return a batch containing values only.
+/// Providers that mint values attach each atomically issued set to a
+/// [`ProviderResource`]. SecretSpec then keeps those values out of persistent
+/// provider caches.
+#[derive(Debug)]
+pub struct ProviderBatch {
+    values: HashMap<String, SecretString>,
+    resources: Vec<ProviderResource>,
+}
+
+impl ProviderBatch {
+    /// A batch of ordinary stored values with no issued resources.
+    pub fn stored(values: HashMap<String, SecretString>) -> Self {
+        Self {
+            values,
+            resources: Vec::new(),
+        }
+    }
+
+    /// A batch that may contain atomically issued resources.
+    pub fn new(
+        values: HashMap<String, SecretString>,
+        resources: Vec<ProviderResource>,
+    ) -> Result<Self> {
+        let batch = Self { values, resources };
+        batch.validate_resources()?;
+        Ok(batch)
+    }
+
+    /// Values returned for this request, keyed by SecretSpec name.
+    pub fn values(&self) -> &HashMap<String, SecretString> {
+        &self.values
+    }
+
+    /// Atomically issued resources in this batch.
+    pub fn resources(&self) -> &[ProviderResource] {
+        &self.resources
+    }
+
+    /// Consumes the batch and returns its values.
+    pub fn into_values(self) -> HashMap<String, SecretString> {
+        self.values
+    }
+
+    pub(crate) fn issued_names(&self) -> HashSet<String> {
+        self.resources
+            .iter()
+            .flat_map(|resource| resource.members.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn validate_requests(&self, requests: &[(&str, Address<'_>)]) -> Result<()> {
+        self.validate_resources()?;
+        let requested: HashSet<&str> = requests.iter().map(|(name, _)| *name).collect();
+        if let Some(name) = self
+            .values
+            .keys()
+            .find(|name| !requested.contains(name.as_str()))
+        {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "provider returned unrequested secret '{name}'"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_resources(&self) -> Result<()> {
+        let mut assigned = HashSet::new();
+        for resource in &self.resources {
+            for member in &resource.members {
+                if !self.values.contains_key(member) {
+                    return Err(SecretSpecError::ProviderOperationFailed(format!(
+                        "issued provider resource is missing value for '{member}'"
+                    )));
+                }
+                if !assigned.insert(member.as_str()) {
+                    return Err(SecretSpecError::ProviderOperationFailed(format!(
+                        "secret '{member}' belongs to more than one issued provider resource"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Value-free availability reported by a provider. Available since SecretSpec
+/// 0.18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAvailability {
+    /// An already stored value is available.
+    Present,
+    /// A value can be issued, but was not created by the probe.
+    Issuable,
+}
+
+/// Result of a value-free provider probe. Available since SecretSpec 0.18.
+#[derive(Debug, Default)]
+pub struct ProviderProbe {
+    availability: HashMap<String, ProviderAvailability>,
+}
+
+impl ProviderProbe {
+    /// Builds a probe result from per-secret availability.
+    pub fn new(availability: HashMap<String, ProviderAvailability>) -> Self {
+        Self { availability }
+    }
+
+    /// Builds a probe result for ordinary stored values.
+    pub fn present(names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::new(
+            names
+                .into_iter()
+                .map(|name| (name.into(), ProviderAvailability::Present))
+                .collect(),
+        )
+    }
+
+    /// Availability for `name`, or `None` when the provider cannot resolve it.
+    pub fn availability(&self, name: &str) -> Option<ProviderAvailability> {
+        self.availability.get(name).copied()
+    }
+
+    pub(crate) fn validate_requests(&self, requests: &[(&str, Address<'_>)]) -> Result<()> {
+        let requested: HashSet<&str> = requests.iter().map(|(name, _)| *name).collect();
+        if let Some(name) = self
+            .availability
+            .keys()
+            .find(|name| !requested.contains(name.as_str()))
+        {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "provider probe returned unrequested secret '{name}'"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Rejects native-address coordinates a provider has no equivalent for.
 ///
 /// Enforced once for every address inside the default
@@ -627,6 +846,38 @@ pub trait Provider: Send + Sync {
         };
         reject_unsupported_coords(self.name(), &coords, self.supported_coords())?;
         Ok(coords)
+    }
+
+    /// Validates an address without reading or issuing its value. Available
+    /// since SecretSpec 0.18.
+    ///
+    /// The default performs the provider's normal coordinate resolution.
+    /// Providers with additional semantic constraints (for example a fixed set
+    /// of fields returned by one dynamic endpoint) override this method. It must
+    /// not contact the backend.
+    fn validate_address(&self, addr: Address<'_>) -> Result<()> {
+        self.resolve_coords(addr)?;
+        Ok(())
+    }
+
+    /// Returns the stable, provider-local identity of the resource that would
+    /// issue `addr`, or `None` for an ordinary stored-secret read. Available
+    /// since SecretSpec 0.18.
+    ///
+    /// The resolver uses this before calling [`fetch_many`](Self::fetch_many):
+    /// requests with the same identity stay in one atomic provider call, while
+    /// different issued resources are isolated from each other's failures.
+    /// The identity is opaque to SecretSpec and must not contain credentials.
+    /// This method only classifies an address; validation happens separately
+    /// through [`validate_address`](Self::validate_address), allowing the
+    /// resolver to reject one invalid member before issuing any member of the
+    /// same resource. It must not contact the backend or issue a value.
+    ///
+    /// Providers that return issued [`ProviderResource`] values **must**
+    /// override this method. Stored providers inherit coordinate validation and
+    /// independent-request behavior from the default.
+    fn issuance_group(&self, _addr: Address<'_>) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Retrieves the secret named by `addr`.
@@ -874,6 +1125,30 @@ pub trait Provider: Send + Sync {
     fn get_many(&self, requests: &[(&str, Address<'_>)]) -> Result<HashMap<String, SecretString>> {
         get_each(self, requests)
     }
+
+    /// Materializes several secrets and describes values issued atomically by
+    /// the provider. Available since SecretSpec 0.18.
+    ///
+    /// Stored-secret providers inherit the ordinary [`get_many`](Self::get_many)
+    /// behavior. A provider that creates credentials, certificates, or tokens
+    /// overrides this method and attaches each issued set to a
+    /// [`ProviderResource`]. It must return the complete set atomically: an
+    /// error must not expose a partial resource as a successful batch.
+    fn fetch_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderBatch> {
+        Ok(ProviderBatch::stored(self.get_many(requests)?))
+    }
+
+    /// Checks whether several secrets are present or issuable without exposing
+    /// their values. Available since SecretSpec 0.18.
+    ///
+    /// The compatibility default performs the existing stored-value reads and
+    /// immediately discards the values. A provider whose read creates anything
+    /// **must** override this method with a non-issuing capability check; value-
+    /// free reports call this method specifically so they never mint dynamic
+    /// credentials as a side effect.
+    fn probe_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderProbe> {
+        Ok(ProviderProbe::present(self.get_many(requests)?.into_keys()))
+    }
 }
 
 /// Default max concurrent unique-address fetches in [`get_each`].
@@ -986,6 +1261,12 @@ impl<T: Provider> Provider for std::sync::Arc<T> {
     fn resolve_coords<'a>(&self, addr: Address<'a>) -> Result<Cow<'a, NativeAddress>> {
         (**self).resolve_coords(addr)
     }
+    fn validate_address(&self, addr: Address<'_>) -> Result<()> {
+        (**self).validate_address(addr)
+    }
+    fn issuance_group(&self, addr: Address<'_>) -> Result<Option<String>> {
+        (**self).issuance_group(addr)
+    }
     fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
         (**self).get(addr)
     }
@@ -1026,6 +1307,12 @@ impl<T: Provider> Provider for std::sync::Arc<T> {
     }
     fn get_many(&self, requests: &[(&str, Address<'_>)]) -> Result<HashMap<String, SecretString>> {
         (**self).get_many(requests)
+    }
+    fn fetch_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderBatch> {
+        (**self).fetch_many(requests)
+    }
+    fn probe_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderProbe> {
+        (**self).probe_many(requests)
     }
 }
 
@@ -1154,6 +1441,16 @@ impl Provider for PreflightGuard {
         self.inner.resolve_coords(addr)
     }
 
+    fn validate_address(&self, addr: Address<'_>) -> Result<()> {
+        // Pure validation, no I/O: needs no auth preflight.
+        self.inner.validate_address(addr)
+    }
+
+    fn issuance_group(&self, addr: Address<'_>) -> Result<Option<String>> {
+        // Pure classification, no I/O: needs no auth preflight.
+        self.inner.issuance_group(addr)
+    }
+
     fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
         self.check()?;
         self.inner.get(addr)
@@ -1221,6 +1518,16 @@ impl Provider for PreflightGuard {
     fn get_many(&self, requests: &[(&str, Address<'_>)]) -> Result<HashMap<String, SecretString>> {
         self.check()?;
         self.inner.get_many(requests)
+    }
+
+    fn fetch_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderBatch> {
+        self.check()?;
+        self.inner.fetch_many(requests)
+    }
+
+    fn probe_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderProbe> {
+        self.check()?;
+        self.inner.probe_many(requests)
     }
 }
 

@@ -49,6 +49,10 @@ Value-free resolutions such as `check --json`, `check --explain`, and SDK
 `no_values` requests may read or discard an existing entry, but never populate
 or refresh one.
 
+Starting in SecretSpec 0.18, values marked as dynamically issued by a provider
+are never written to a provider cache. Their backend lifetime, rather than a
+copied cache envelope, remains authoritative.
+
 ## Writes
 
 Writes and generated values go to the first fallback (`azure` above), then

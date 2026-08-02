@@ -19,6 +19,8 @@ final class SecretReport
         public readonly string $status,
         public readonly bool $required,
         public readonly ?string $sourceProvider,
+        /** Provider can issue the value without report-time materialization (0.18+). */
+        public readonly bool $issuable,
         public readonly bool $defaultApplied,
         public readonly bool $generated,
         public readonly bool $asPath,

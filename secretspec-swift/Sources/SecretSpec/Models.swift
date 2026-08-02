@@ -139,6 +139,8 @@ public struct SecretReport: Decodable, Sendable {
     public let status: String
     public let required: Bool
     public let sourceProvider: String?
+    /// Provider can issue the value without report-time materialization (0.18+).
+    public let issuable: Bool
     public let defaultApplied: Bool
     public let generated: Bool
     public let asPath: Bool
@@ -148,9 +150,22 @@ public struct SecretReport: Decodable, Sendable {
         case status
         case required
         case sourceProvider = "source_provider"
+        case issuable
         case defaultApplied = "default_applied"
         case generated
         case asPath = "as_path"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        name = try values.decode(String.self, forKey: .name)
+        status = try values.decode(String.self, forKey: .status)
+        required = try values.decodeIfPresent(Bool.self, forKey: .required) ?? false
+        sourceProvider = try values.decodeIfPresent(String.self, forKey: .sourceProvider)
+        issuable = try values.decodeIfPresent(Bool.self, forKey: .issuable) ?? false
+        defaultApplied = try values.decodeIfPresent(Bool.self, forKey: .defaultApplied) ?? false
+        generated = try values.decodeIfPresent(Bool.self, forKey: .generated) ?? false
+        asPath = try values.decodeIfPresent(Bool.self, forKey: .asPath) ?? false
     }
 }
 

@@ -9,7 +9,9 @@ use crate::config::{
 use crate::error::{Result, SecretSpecError};
 use crate::manifest::{CompiledManifest, MissingPolicy};
 use crate::plan::{PlannedSecret, ResolutionPlan, ResolvedCache, Route};
-use crate::provider::{Address, Provider as ProviderTrait, ProviderCredentials};
+use crate::provider::{
+    Address, Provider as ProviderTrait, ProviderAvailability, ProviderCredentials,
+};
 use crate::report::{ResolutionReport, ResolutionStatus, SecretResolution};
 use crate::resolve::{RESOLVE_SCHEMA_VERSION, ResolveResponse, ResolvedSecret, ResolvedSource};
 use crate::validation::{ConstraintKind, ConstraintViolation, ValidatedSecrets, ValidationErrors};
@@ -241,6 +243,35 @@ type GroupFetch<'a> = (
     Box<dyn ProviderTrait>,
 );
 
+#[derive(Default)]
+struct ProviderResolution {
+    values: HashMap<String, SecretString>,
+    availability: HashMap<String, ProviderAvailability>,
+    issued: HashSet<String>,
+    failures: Vec<ProviderFailure>,
+}
+
+struct ProviderFailure {
+    names: Vec<String>,
+    error: SecretSpecError,
+}
+
+impl ProviderResolution {
+    fn extend(&mut self, other: Self) {
+        self.values.extend(other.values);
+        self.availability.extend(other.availability);
+        self.issued.extend(other.issued);
+        self.failures.extend(other.failures);
+    }
+}
+
+struct ProviderLookup {
+    value: Option<SecretString>,
+    availability: Option<ProviderAvailability>,
+    issued: bool,
+    uri: Option<String>,
+}
+
 /// Memoized provider credentials with single-flight population per key.
 ///
 /// The outer mutex protects only the key-to-slot map. Resolution runs while
@@ -302,7 +333,7 @@ impl ProviderCredentialsCache {
 }
 
 /// Emits a warning when the primary provider for a batch fetch fails (either
-/// during construction or during `get_many`); affected secrets will still be
+/// during construction or a batch fetch/probe); affected secrets will still be
 /// retried via their per-secret fallback chain below.
 ///
 /// Like [`warn_provider_failure`], `display_uri` must already be credential-free
@@ -321,11 +352,11 @@ fn warn_primary_provider_failure(display_uri: Option<&str>, err: &SecretSpecErro
 
 /// Whether a resolution pass may produce side effects and persist secrets.
 ///
-/// A resolution pass always queries providers to learn what is present, but the
-/// two value-free entry points ([`Secrets::report`], [`Secrets::resolve_without_values`])
-/// must not change anything as a side effect of reading. This flag gates the two
-/// mutating steps of a pass so those entry points can share the exact same
-/// resolution logic without inheriting its side effects.
+/// A resolution pass always contacts providers to learn what is present or
+/// issuable, but the two value-free entry points ([`Secrets::report`],
+/// [`Secrets::resolve_without_values`]) must not change anything as a side
+/// effect. This flag selects value fetches or non-issuing probes and gates the
+/// other mutating steps of a pass.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Materialize {
     /// Full pass: mint-and-store a missing generatable secret and write each
@@ -1707,22 +1738,268 @@ impl Secrets {
             })
     }
 
-    /// Fetches one provider group's secrets through the provider's batch
-    /// surface: every planned secret's [`Address`] (native `ref` coordinates or
-    /// convention naming) is handed to `get_many`, which dedupes identical
-    /// coordinates and batches or parallelizes as the store allows. The address
-    /// is the one the plan already derived, so naming lives in exactly one place.
+    fn fetch_requests(
+        provider: &dyn ProviderTrait,
+        requests: &[(&str, Address<'_>)],
+        materialize: Materialize,
+    ) -> Result<ProviderResolution> {
+        match materialize {
+            Materialize::Values => {
+                let batch = provider.fetch_many(requests)?;
+                batch.validate_requests(requests)?;
+                let issued = batch.issued_names();
+                let values = batch.into_values();
+                let availability = values
+                    .keys()
+                    .cloned()
+                    .map(|name| (name, ProviderAvailability::Present))
+                    .collect();
+                Ok(ProviderResolution {
+                    values,
+                    availability,
+                    issued,
+                    failures: Vec::new(),
+                })
+            }
+            Materialize::None => {
+                let probe = provider.probe_many(requests)?;
+                probe.validate_requests(requests)?;
+                let availability = requests
+                    .iter()
+                    .filter_map(|(name, _)| {
+                        probe
+                            .availability(name)
+                            .map(|availability| ((*name).to_string(), availability))
+                    })
+                    .collect();
+                Ok(ProviderResolution {
+                    values: HashMap::new(),
+                    availability,
+                    issued: HashSet::new(),
+                    failures: Vec::new(),
+                })
+            }
+        }
+    }
+
+    /// Fetches one provider group's secrets without letting a request-specific
+    /// failure change another secret's provider precedence.
+    ///
+    /// Ordinary stored reads are attempted as one efficient batch. If that
+    /// batch fails, each request is retried independently so a malformed or
+    /// unsupported address cannot push unrelated names to a lower fallback.
+    /// Issuing providers classify addresses up front with
+    /// [`Provider::issuance_group`](crate::provider::Provider::issuance_group);
+    /// every atomic resource group is called separately and is never split by
+    /// the resolver.
     fn fetch_group(
         provider: &dyn ProviderTrait,
         group: &[&PlannedSecret],
         project: &str,
         profile: &str,
-    ) -> Result<HashMap<String, SecretString>> {
-        let requests: Vec<(&str, Address<'_>)> = group
+        materialize: Materialize,
+    ) -> ProviderResolution {
+        let mut resolved = ProviderResolution::default();
+        let mut stored = Vec::new();
+        let mut issued: BTreeMap<String, Vec<(&str, Address<'_>)>> = BTreeMap::new();
+
+        for planned in group {
+            let addr = planned.as_address(project, profile);
+            match provider.issuance_group(addr) {
+                Ok(Some(identity)) => issued
+                    .entry(identity)
+                    .or_default()
+                    .push((planned.name.as_str(), addr)),
+                Ok(None) => match provider.validate_address(addr) {
+                    Ok(()) => stored.push((planned.name.as_str(), addr)),
+                    Err(error) => resolved.failures.push(ProviderFailure {
+                        names: vec![planned.name.clone()],
+                        error,
+                    }),
+                },
+                Err(error) => resolved.failures.push(ProviderFailure {
+                    names: vec![planned.name.clone()],
+                    error,
+                }),
+            }
+        }
+
+        if !stored.is_empty() {
+            match Self::fetch_requests(provider, &stored, materialize) {
+                Ok(batch) => resolved.extend(batch),
+                Err(batch_error) if stored.len() == 1 => {
+                    resolved.failures.push(ProviderFailure {
+                        names: vec![stored[0].0.to_string()],
+                        error: batch_error,
+                    });
+                }
+                Err(_) => {
+                    // Stored reads are side-effect free, so a failed bulk read
+                    // can be retried one address at a time to recover unaffected
+                    // results and retain per-secret fallback precedence.
+                    for request in &stored {
+                        match Self::fetch_requests(
+                            provider,
+                            std::slice::from_ref(request),
+                            materialize,
+                        ) {
+                            Ok(batch) => resolved.extend(batch),
+                            Err(error) => resolved.failures.push(ProviderFailure {
+                                names: vec![request.0.to_string()],
+                                error,
+                            }),
+                        }
+                    }
+                }
+            }
+        }
+
+        for requests in issued.into_values() {
+            if let Some(error) = requests
+                .iter()
+                .find_map(|(_, addr)| provider.validate_address(*addr).err())
+            {
+                resolved.failures.push(ProviderFailure {
+                    names: requests
+                        .iter()
+                        .map(|(name, _)| (*name).to_string())
+                        .collect(),
+                    error,
+                });
+                continue;
+            }
+            match Self::fetch_requests(provider, &requests, materialize) {
+                Ok(batch) => resolved.extend(batch),
+                Err(error) => resolved.failures.push(ProviderFailure {
+                    names: requests
+                        .iter()
+                        .map(|(name, _)| (*name).to_string())
+                        .collect(),
+                    error,
+                }),
+            }
+        }
+
+        resolved
+    }
+
+    /// Walks one shared fallback chain for all unresolved secrets that declare
+    /// it, preserving the provider batch at every stage. This matters for
+    /// providers that issue several fields as one resource: falling back must
+    /// not degrade `DB_USERNAME` and `DB_PASSWORD` into independent requests.
+    ///
+    /// Specs remain lazy. A later alias is resolved and built only if at least
+    /// one secret missed every earlier stage, matching the single-secret chain
+    /// behavior used by `get`.
+    fn fetch_fallback_group(
+        &self,
+        specs: &[String],
+        mut group: Vec<&PlannedSecret>,
+        project: &str,
+        profile: &str,
+        materialize: Materialize,
+        output_filter: Option<&HashSet<String>>,
+    ) -> Result<(ProviderResolution, HashMap<String, String>)> {
+        let mut resolved = ProviderResolution::default();
+        let mut source_uris = HashMap::new();
+        let mut errors = Vec::new();
+        let mut last_error_by_name = HashMap::new();
+        let mut healthy_names = HashSet::new();
+
+        for spec in specs {
+            if group.is_empty() {
+                break;
+            }
+
+            let uri = match self.resolve_one_provider(spec) {
+                Ok(uri) => uri,
+                Err(error) => {
+                    let display_uri = crate::audit::redact_uri_strict(spec);
+                    for planned in &group {
+                        warn_provider_failure(
+                            &display_uri,
+                            Self::diagnostic_secret_name(&planned.name, output_filter),
+                            &error,
+                        );
+                    }
+                    let error_index = errors.len();
+                    for planned in &group {
+                        last_error_by_name.insert(planned.name.clone(), error_index);
+                    }
+                    errors.push(error);
+                    continue;
+                }
+            };
+            let provider = match self.build_provider(spec.clone(), Some(profile)) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    let display_uri = crate::audit::redact_uri_strict(&uri);
+                    for planned in &group {
+                        warn_provider_failure(
+                            &display_uri,
+                            Self::diagnostic_secret_name(&planned.name, output_filter),
+                            &error,
+                        );
+                    }
+                    let error_index = errors.len();
+                    for planned in &group {
+                        last_error_by_name.insert(planned.name.clone(), error_index);
+                    }
+                    errors.push(error);
+                    continue;
+                }
+            };
+            let provider_uri = provider.uri();
+            let mut batch =
+                Self::fetch_group(provider.as_ref(), &group, project, profile, materialize);
+            let mut failed_names = HashSet::new();
+            for failure in batch.failures.drain(..) {
+                let error_index = errors.len();
+                for name in &failure.names {
+                    failed_names.insert(name.clone());
+                    last_error_by_name.insert(name.clone(), error_index);
+                    if let Some(planned) = group.iter().find(|planned| planned.name == *name) {
+                        warn_provider_failure(
+                            &provider_uri,
+                            Self::diagnostic_secret_name(&planned.name, output_filter),
+                            &failure.error,
+                        );
+                    }
+                }
+                errors.push(failure.error);
+            }
+
+            // A successful request is healthy even when it missed. Failed
+            // requests remain eligible for the next provider without changing
+            // the precedence of their successful siblings.
+            for planned in &group {
+                if !failed_names.contains(&planned.name) {
+                    healthy_names.insert(planned.name.clone());
+                }
+            }
+            for name in batch.availability.keys() {
+                source_uris.insert(name.clone(), provider_uri.clone());
+            }
+            group.retain(|planned| !batch.availability.contains_key(&planned.name));
+            resolved.extend(batch);
+        }
+
+        // If every reachable provider errored for any still-unresolved secret,
+        // absence was never established for that secret. Healthy outcomes for
+        // a sibling must not hide its final failure.
+        let error_index = group
             .iter()
-            .map(|planned| (planned.name.as_str(), planned.as_address(project, profile)))
-            .collect();
-        provider.get_many(&requests)
+            .filter(|planned| !healthy_names.contains(&planned.name))
+            .filter_map(|planned| last_error_by_name.get(&planned.name).copied())
+            .max();
+        if let Some(error_index) = error_index {
+            return Err(errors
+                .into_iter()
+                .nth(error_index)
+                .expect("recorded fallback error index must exist"));
+        }
+
+        Ok((resolved, source_uris))
     }
 
     /// Read and validate one cached envelope. Every cache failure is fail-open:
@@ -2247,6 +2524,40 @@ impl Secrets {
 
     /// Gets a secret from a chain of provider specs with fallback.
     ///
+    fn query_provider(
+        provider: &dyn ProviderTrait,
+        secret_name: &str,
+        addr: Address<'_>,
+        materialize: Materialize,
+    ) -> Result<ProviderLookup> {
+        let requests = [(secret_name, addr)];
+        match materialize {
+            Materialize::Values => {
+                let batch = provider.fetch_many(&requests)?;
+                batch.validate_requests(&requests)?;
+                let issued = batch.issued_names().contains(secret_name);
+                let value = batch.into_values().remove(secret_name);
+                let availability = value.as_ref().map(|_| ProviderAvailability::Present);
+                Ok(ProviderLookup {
+                    value,
+                    availability,
+                    issued,
+                    uri: None,
+                })
+            }
+            Materialize::None => {
+                let probe = provider.probe_many(&requests)?;
+                probe.validate_requests(&requests)?;
+                Ok(ProviderLookup {
+                    value: None,
+                    availability: probe.availability(secret_name),
+                    issued: false,
+                    uri: None,
+                })
+            }
+        }
+    }
+
     /// Tries each provider in order until one has the secret. Each spec is
     /// resolved to a URI **only when the chain reaches it** — every earlier
     /// provider having missed. A spec that fails to resolve (an undefined
@@ -2284,7 +2595,8 @@ impl Secrets {
         addr: Address<'_>,
         provider_specs: Option<&[String]>,
         profile: Option<&str>,
-    ) -> Result<(Option<SecretString>, Option<String>)> {
+        materialize: Materialize,
+    ) -> Result<ProviderLookup> {
         // If a provider chain is supplied, try it in order.
         if let Some(specs) = provider_specs {
             let mut last_error: Option<SecretSpecError> = None;
@@ -2330,9 +2642,12 @@ impl Secrets {
                 // `uri()` but that `redact_uri` cannot remove from an opaque URI.
                 let provider_uri = provider.uri();
                 last_uri = Some(provider_uri.clone());
-                match provider.get(addr) {
-                    Ok(Some(value)) => return Ok((Some(value), Some(provider_uri))),
-                    Ok(None) => {
+                match Self::query_provider(provider.as_ref(), secret_name, addr, materialize) {
+                    Ok(mut lookup) if lookup.availability.is_some() => {
+                        lookup.uri = Some(provider_uri);
+                        return Ok(lookup);
+                    }
+                    Ok(_) => {
                         any_healthy = true;
                         continue;
                     }
@@ -2349,13 +2664,21 @@ impl Secrets {
             // a healthy "not found" — otherwise the secret is genuinely missing.
             match last_error {
                 Some(e) if !any_healthy => Err(e),
-                _ => Ok((None, last_uri)),
+                _ => Ok(ProviderLookup {
+                    value: None,
+                    availability: None,
+                    issued: false,
+                    uri: last_uri,
+                }),
             }
         } else {
             // No per-secret providers, use default provider
             let backend = self.get_provider(None, profile)?;
             let uri = backend.uri();
-            backend.get(addr).map(|opt| (opt, Some(uri)))
+            let mut lookup =
+                Self::query_provider(backend.as_ref(), secret_name, addr, materialize)?;
+            lookup.uri = Some(uri);
+            Ok(lookup)
         }
     }
 
@@ -2684,7 +3007,12 @@ impl Secrets {
         let result =
             if let Some((value, uri)) = self.read_cached_secret(&planned, route, &profile_name) {
                 cache_hit = true;
-                Ok((Some(value), Some(uri)))
+                Ok(ProviderLookup {
+                    value: Some(value),
+                    availability: Some(ProviderAvailability::Present),
+                    issued: false,
+                    uri: Some(uri),
+                })
             } else {
                 // Walk the route's chain in order; each entry is resolved lazily and a
                 // broken link is skipped with a warning, so an undefined alias never
@@ -2695,8 +3023,14 @@ impl Secrets {
                     planned.as_address(&self.config.project.name, &profile_name),
                     read_specs.as_deref(),
                     Some(&profile_name),
+                    Materialize::Values,
                 );
-                if let Ok((Some(value), _)) = &result {
+                if let Ok(ProviderLookup {
+                    value: Some(value),
+                    issued: false,
+                    ..
+                }) = &result
+                {
                     self.write_cached_secret(&planned, route, &profile_name, value);
                 }
                 result
@@ -2709,7 +3043,11 @@ impl Secrets {
         // names only the store.
         let reference = (!cache_hit).then(|| planned.reference()).flatten();
         match &result {
-            Ok((Some(_), uri)) => self.record(
+            Ok(ProviderLookup {
+                value: Some(_),
+                uri,
+                ..
+            }) => self.record(
                 AuditAction::Get,
                 &profile_name,
                 AuditOutcome::Found,
@@ -2720,7 +3058,9 @@ impl Secrets {
                     ..Default::default()
                 },
             ),
-            Ok((None, uri)) if default.is_some() => self.record(
+            Ok(ProviderLookup {
+                value: None, uri, ..
+            }) if default.is_some() => self.record(
                 AuditAction::Get,
                 &profile_name,
                 AuditOutcome::Default,
@@ -2731,7 +3071,9 @@ impl Secrets {
                     ..Default::default()
                 },
             ),
-            Ok((None, uri)) => self.record(
+            Ok(ProviderLookup {
+                value: None, uri, ..
+            }) => self.record(
                 AuditAction::Get,
                 &profile_name,
                 AuditOutcome::Missing,
@@ -2747,7 +3089,7 @@ impl Secrets {
             }
         }
 
-        match result?.0 {
+        match result?.value {
             Some(value) => {
                 if as_path {
                     // Write to temp file and persist it (don't auto-delete)
@@ -3506,11 +3848,11 @@ impl Secrets {
     /// `missing_optional`) are still populated. This backs the `no_values`
     /// request path, so a policy/preflight consumer gets the resolve shape
     /// without persisting a secret to disk or mutating a provider. Resolution
-    /// still queries providers so provenance can be reported — a value may
-    /// transit memory transiently to learn whether it is present — but nothing
-    /// is materialized; a missing required secret still fails the same way as
-    /// [`Self::resolve`]. For a value-free view that tolerates missing required
-    /// secrets, use [`Self::report`].
+    /// still contacts providers so provenance can be reported. Stored-secret
+    /// providers may read and immediately discard a value; dynamic providers
+    /// use their non-issuing probe path. A missing required secret still fails
+    /// the same way as [`Self::resolve`]. For a value-free view that tolerates
+    /// missing required secrets, use [`Self::report`].
     pub fn resolve_without_values(&self) -> Result<ResolveResponse> {
         self.resolve_impl(false)
     }
@@ -3966,7 +4308,10 @@ impl Secrets {
         // failed group with no fallback surface the original error rather than
         // being reported as missing.
         let mut fetched_values: HashMap<String, SecretString> = HashMap::new();
+        let mut fetched_availability: HashMap<String, ProviderAvailability> = HashMap::new();
+        let mut issued_names: HashSet<String> = HashSet::new();
         let mut failed_primary_uris: HashMap<Option<&str>, SecretSpecError> = HashMap::new();
+        let mut failed_primary_names: Vec<ProviderFailure> = Vec::new();
         let mut cached_uris: HashMap<String, String> = HashMap::new();
 
         // Consult caches before constructing source providers. Cache hits are
@@ -3975,6 +4320,7 @@ impl Secrets {
         // cached route useful when its remote provider is slow or unavailable.
         for (name, (value, uri)) in self.read_cached_group(plan, profile) {
             cached_uris.insert(name.clone(), uri);
+            fetched_availability.insert(name.clone(), ProviderAvailability::Present);
             fetched_values.insert(name, value);
         }
 
@@ -4026,21 +4372,22 @@ impl Secrets {
             (provider_uri, group, provider): GroupFetch<'a>,
             project: &str,
             profile: &str,
-        ) -> (Option<&'a str>, Result<HashMap<String, SecretString>>) {
-            let result = Secrets::fetch_group(&*provider, &group, project, profile);
+            materialize: Materialize,
+        ) -> (Option<&'a str>, ProviderResolution) {
+            let result = Secrets::fetch_group(&*provider, &group, project, profile, materialize);
             (provider_uri, result)
         }
 
-        let fetch_results: Vec<(Option<&str>, Result<_>)> = if group_fetches.len() <= 1 {
+        let fetch_results: Vec<(Option<&str>, ProviderResolution)> = if group_fetches.len() <= 1 {
             group_fetches
                 .into_iter()
-                .map(|group| fetch_group(group, project, profile))
+                .map(|group| fetch_group(group, project, profile, materialize))
                 .collect()
         } else {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = group_fetches
                     .into_iter()
-                    .map(|group| scope.spawn(|| fetch_group(group, project, profile)))
+                    .map(|group| scope.spawn(|| fetch_group(group, project, profile, materialize)))
                     .collect();
                 handles
                     .into_iter()
@@ -4049,17 +4396,58 @@ impl Secrets {
             })
         };
 
-        for (provider_uri, result) in fetch_results {
-            match result {
-                Ok(batch_results) => fetched_values.extend(batch_results),
-                Err(e) => {
-                    // A provider was built; attribute to its credential-free
-                    // `uri()`, already recorded in `group_uris` above.
-                    let display_uri = group_uris.get(&provider_uri).map(String::as_str);
-                    warn_primary_provider_failure(display_uri, &e);
-                    failed_primary_uris.insert(provider_uri, e);
+        for (provider_uri, mut batch_results) in fetch_results {
+            // A provider was built; attribute request-specific failures to its
+            // credential-free `uri()` without losing successful siblings from
+            // the same batch.
+            let display_uri = group_uris.get(&provider_uri).map(String::as_str);
+            for failure in batch_results.failures.drain(..) {
+                for name in &failure.names {
+                    warn_provider_failure(display_uri.unwrap_or("<default>"), name, &failure.error);
+                }
+                failed_primary_names.push(failure);
+            }
+            fetched_values.extend(batch_results.values);
+            fetched_availability.extend(batch_results.availability);
+            issued_names.extend(batch_results.issued);
+        }
+
+        // Secrets that missed their primary are grouped by the exact remaining
+        // chain and walk each fallback stage as one batch. The old per-secret
+        // walk was equivalent for stored values, but split fields of one
+        // dynamically issued resource into separate generations.
+        let mut fallback_groups: Vec<(&[String], Vec<&PlannedSecret>)> = Vec::new();
+        let mut fallback_group_index: HashMap<&[String], usize> = HashMap::new();
+        for planned in &plan.secrets {
+            if fetched_availability.contains_key(&planned.name) {
+                continue;
+            }
+            let Some(specs) = planned.route.as_ref().and_then(Route::fallback_specs) else {
+                continue;
+            };
+            match fallback_group_index.get(specs) {
+                Some(&index) => fallback_groups[index].1.push(planned),
+                None => {
+                    fallback_group_index.insert(specs, fallback_groups.len());
+                    fallback_groups.push((specs, vec![planned]));
                 }
             }
+        }
+
+        let mut fallback_uris = HashMap::new();
+        for (specs, group) in fallback_groups {
+            let (fallback, source_uris) = self.fetch_fallback_group(
+                specs,
+                group,
+                project,
+                profile,
+                materialize,
+                output_filter,
+            )?;
+            fetched_values.extend(fallback.values);
+            fetched_availability.extend(fallback.availability);
+            issued_names.extend(fallback.issued);
+            fallback_uris.extend(source_uris);
         }
 
         // Process each planned secret: apply the fetched value, its fallback
@@ -4082,15 +4470,29 @@ impl Secrets {
             let mut source_provider = None;
             let mut default_applied = false;
             let mut generated = false;
+            let mut issuable = false;
 
-            match fetched_values.remove(name.as_str()) {
-                Some(value) => {
+            match fetched_availability.remove(name.as_str()) {
+                Some(availability) => {
+                    let value = fetched_values.remove(name.as_str());
                     let was_cached = cached_uris.contains_key(name);
                     source_provider = cached_uris
                         .remove(name)
+                        .or_else(|| fallback_uris.remove(name))
                         .or_else(|| group_uris.get(&primary_uri).cloned());
-                    if !was_cached && materialize == Materialize::Values {
-                        self.write_cached_secret(planned, route, profile, &value);
+                    issuable = availability == ProviderAvailability::Issuable;
+                    if !was_cached
+                        && materialize == Materialize::Values
+                        && !issued_names.contains(name)
+                    {
+                        self.write_cached_secret(
+                            planned,
+                            route,
+                            profile,
+                            value
+                                .as_ref()
+                                .expect("a materialized provider hit always carries a value"),
+                        );
                     }
                     // Copy the value into the response only on a full pass; a
                     // value-free pass has the status it needs and never
@@ -4100,115 +4502,79 @@ impl Secrets {
                             &mut secrets,
                             &mut temp_files,
                             name.clone(),
-                            value,
+                            value.expect("a materialized provider hit always carries a value"),
                             as_path,
                         )?;
                     }
                     status = ResolutionStatus::Resolved;
                 }
                 None => {
-                    let primary_failed = failed_primary_uris.contains_key(&primary_uri);
+                    let name_failure = failed_primary_names
+                        .iter()
+                        .position(|failure| failure.names.iter().any(|failed| failed == name));
+                    let primary_failed =
+                        name_failure.is_some() || failed_primary_uris.contains_key(&primary_uri);
 
-                    // The primary missed, so now walk the fallback — tried in
-                    // order, each entry resolved lazily inside the chain walk; an
-                    // undefined alias is skipped with a warning so a working
-                    // provider after it still answers. An override or the
-                    // default store has no fallback. The chain warns per secret,
-                    // so it is handed the diagnostic label rather than the raw
-                    // name: under a scope this secret may be a hidden
-                    // composition input the consumer must not learn about.
-                    let (fallback_value, fallback_uri) = match route.fallback_specs() {
-                        Some(fallback) => {
-                            let resolved = self.get_secret_from_providers(
-                                Self::diagnostic_secret_name(name, output_filter),
-                                planned.as_address(project, profile),
-                                Some(fallback),
-                                Some(profile),
-                            )?;
-                            // A primary that errored plus an exhausted fallback
-                            // chain is not "missing": the authoritative provider
-                            // is unreachable and might hold the value. Surface the
-                            // primary error, exactly as the no-fallback arm below.
-                            if resolved.0.is_none() && primary_failed {
-                                let err = failed_primary_uris
-                                    .remove(&primary_uri)
-                                    .expect("primary_failed implies entry present");
-                                return Err(err);
-                            }
-                            resolved
-                        }
-                        // No alternative chain and the primary failed: surface the
-                        // original error rather than reporting a spurious missing.
-                        None if primary_failed => {
-                            let err = failed_primary_uris
+                    // Fallback stages already ran in batches above. If the
+                    // primary errored and none answered, absence was never
+                    // established: preserve the outage instead of reporting a
+                    // missing declaration.
+                    if primary_failed {
+                        let err = match name_failure {
+                            Some(index) => failed_primary_names.swap_remove(index).error,
+                            None => failed_primary_uris
                                 .remove(&primary_uri)
-                                .expect("primary_failed implies entry present");
-                            return Err(err);
-                        }
-                        None => (None, None),
-                    };
+                                .expect("primary_failed implies entry present"),
+                        };
+                        return Err(err);
+                    }
 
-                    if let Some(value) = fallback_value {
-                        source_provider = fallback_uri;
-                        if materialize == Materialize::Values {
-                            self.write_cached_secret(planned, route, profile, &value);
-                            self.insert_resolved(
-                                &mut secrets,
-                                &mut temp_files,
-                                name.clone(),
-                                value,
-                                as_path,
-                            )?;
+                    match planned.secret.missing {
+                        MissingPolicy::Generate => {
+                            // A full pass mints and stores; a value-free pass
+                            // reports that generation would resolve without
+                            // performing that side effect.
+                            generated = true;
+                            if materialize == Materialize::Values {
+                                let generated_value = self
+                                    .try_generate_secret(planned, profile)?
+                                    .expect("compiled Generate policy has a generator");
+                                self.insert_resolved(
+                                    &mut secrets,
+                                    &mut temp_files,
+                                    name.clone(),
+                                    generated_value,
+                                    as_path,
+                                )?;
+                            }
+                            status = ResolutionStatus::Resolved;
                         }
-                        status = ResolutionStatus::Resolved;
-                    } else {
-                        match planned.secret.missing {
-                            MissingPolicy::Generate => {
-                                // A full pass mints and stores; a value-free pass
-                                // reports that generation would resolve without
-                                // performing that side effect.
-                                generated = true;
-                                if materialize == Materialize::Values {
-                                    let generated_value = self
-                                        .try_generate_secret(planned, profile)?
-                                        .expect("compiled Generate policy has a generator");
-                                    self.insert_resolved(
-                                        &mut secrets,
-                                        &mut temp_files,
-                                        name.clone(),
-                                        generated_value,
-                                        as_path,
-                                    )?;
-                                }
-                                status = ResolutionStatus::Resolved;
+                        MissingPolicy::UseDefault => {
+                            let default_value = planned
+                                .config()
+                                .default
+                                .as_ref()
+                                .expect("compiled UseDefault policy has a default");
+                            default_applied = true;
+                            if materialize == Materialize::Values {
+                                self.insert_resolved(
+                                    &mut secrets,
+                                    &mut temp_files,
+                                    name.clone(),
+                                    SecretString::new(default_value.clone().into()),
+                                    as_path,
+                                )?;
+                                with_defaults.push((name.clone(), default_value.clone()));
                             }
-                            MissingPolicy::UseDefault => {
-                                let default_value = planned
-                                    .config()
-                                    .default
-                                    .as_ref()
-                                    .expect("compiled UseDefault policy has a default");
-                                default_applied = true;
-                                if materialize == Materialize::Values {
-                                    self.insert_resolved(
-                                        &mut secrets,
-                                        &mut temp_files,
-                                        name.clone(),
-                                        SecretString::new(default_value.clone().into()),
-                                        as_path,
-                                    )?;
-                                    with_defaults.push((name.clone(), default_value.clone()));
-                                }
-                                status = ResolutionStatus::Resolved;
-                            }
-                            MissingPolicy::Error => {
-                                missing_required.push(name.clone());
-                                status = ResolutionStatus::MissingRequired;
-                            }
-                            MissingPolicy::Omit => {
-                                missing_optional.push(name.clone());
-                                status = ResolutionStatus::MissingOptional;
-                            }
+                            status = ResolutionStatus::Resolved;
+                        }
+                        MissingPolicy::Error => {
+                            missing_required.push(name.clone());
+                            status = ResolutionStatus::MissingRequired;
+                        }
+                        MissingPolicy::Omit => {
+                            missing_optional.push(name.clone());
+                            status = ResolutionStatus::MissingOptional;
                         }
                     }
                 }
@@ -4219,6 +4585,7 @@ impl Secrets {
                 status,
                 required,
                 source_provider,
+                issuable,
                 default_applied,
                 generated,
                 composed: false,
@@ -4315,6 +4682,7 @@ impl Secrets {
                     status,
                     required: planned.required(),
                     source_provider: None,
+                    issuable: false,
                     default_applied: false,
                     generated: false,
                     composed: true,

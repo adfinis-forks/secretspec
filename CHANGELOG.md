@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of always pointing at a `ref` item the config may not contain.
 
 ### Added
+- Provider integrations can now return atomically issued, expiring resource
+  fields. Value-free reports and every SDK report model can mark those fields as
+  issuable without minting them, issued fields stay atomic through fallback
+  chains without changing unrelated secrets' provider precedence, and issued
+  values are not copied into configured provider caches.
 - Swift SDK (available in 0.18) for resolving SecretSpec manifests from macOS
   12+ on Intel and Apple silicon. The SwiftPM package provides fluent and
   one-shot resolution, typed failures, scopes, value-free reports, provenance,

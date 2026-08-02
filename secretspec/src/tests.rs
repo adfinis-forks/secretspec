@@ -580,6 +580,350 @@ pub(crate) fn resolve_test_config(secrets: HashMap<String, Secret>) -> Config {
     }
 }
 
+static ISSUING_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn issuing_secret(field: &str, provider: &str) -> Secret {
+    Secret {
+        providers: Some(vec![provider.to_string()]),
+        reference: Some(NativeAddress {
+            item: "developer".to_string(),
+            field: Some(field.to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn issuing_credentials_config(provider: &str) -> Config {
+    resolve_test_config(HashMap::from([
+        (
+            "DB_USERNAME".to_string(),
+            issuing_secret("username", provider),
+        ),
+        (
+            "DB_PASSWORD".to_string(),
+            issuing_secret("password", provider),
+        ),
+    ]))
+}
+
+#[test]
+fn issued_fields_are_atomic_and_value_free_reports_do_not_mint_them() {
+    let _guard = ISSUING_TEST_GUARD.lock().unwrap();
+    crate::provider::tests::reset_issuing_test_provider();
+
+    let mut config = issuing_credentials_config("database");
+    config.providers = Some(HashMap::from([(
+        "database".to_string(),
+        ProviderAlias::from("issuing-test://"),
+    )]));
+    let secrets = Secrets::new(config, None, None, None);
+
+    let report = secrets.report().unwrap();
+    assert!(report.all_required_present());
+    assert!(report.secrets.iter().all(|entry| entry.issuable));
+    assert!(
+        report
+            .secrets
+            .iter()
+            .all(|entry| entry.source_provider.as_deref() == Some("issuing-test://"))
+    );
+    assert!(
+        serde_json::to_value(&report).unwrap()["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["issuable"] == true)
+    );
+    assert!(
+        report
+            .to_explain_string()
+            .contains("ok        issuable by issuing-test://")
+    );
+    assert_eq!(crate::provider::tests::issuing_test_counts(), (0, 1));
+
+    let resolved = secrets.resolve().unwrap();
+    assert_eq!(
+        resolved.secrets["DB_USERNAME"].value.as_deref().unwrap(),
+        "user-1"
+    );
+    assert_eq!(
+        resolved.secrets["DB_PASSWORD"].value.as_deref().unwrap(),
+        "password-1"
+    );
+    assert_eq!(
+        crate::provider::tests::issuing_test_counts(),
+        (1, 1),
+        "both fields of one item must come from one issuance"
+    );
+}
+
+#[test]
+fn issued_fields_remain_one_resource_when_reached_through_fallback() {
+    let _guard = ISSUING_TEST_GUARD.lock().unwrap();
+    crate::provider::tests::reset_issuing_test_provider();
+    let temp = TempDir::new().unwrap();
+    let empty = temp.path().join("empty.env");
+    fs::write(&empty, "").unwrap();
+
+    let mut config = issuing_credentials_config("stored_first");
+    for secret in config
+        .profiles
+        .get_mut("default")
+        .unwrap()
+        .secrets
+        .values_mut()
+    {
+        secret.providers = Some(vec!["empty".to_string(), "database".to_string()]);
+    }
+    config.providers = Some(HashMap::from([
+        (
+            "empty".to_string(),
+            ProviderAlias::from(format!("dotenv://{}", empty.display())),
+        ),
+        (
+            "database".to_string(),
+            ProviderAlias::from("issuing-test://"),
+        ),
+    ]));
+    let secrets = Secrets::new(config, None, None, None);
+
+    let report = secrets.report().unwrap();
+    assert!(report.secrets.iter().all(|entry| entry.issuable));
+    assert_eq!(crate::provider::tests::issuing_test_counts(), (0, 1));
+
+    let resolved = secrets.resolve().unwrap();
+    assert_eq!(
+        resolved.secrets["DB_USERNAME"].value.as_deref(),
+        Some("user-1")
+    );
+    assert_eq!(
+        resolved.secrets["DB_PASSWORD"].value.as_deref(),
+        Some("password-1")
+    );
+    assert_eq!(
+        crate::provider::tests::issuing_test_counts(),
+        (1, 1),
+        "the shared fallback stage must preserve one issuance batch"
+    );
+}
+
+#[test]
+fn a_fallback_address_error_does_not_change_a_sibling_secret_precedence() {
+    let _env = scrub_resolution_env();
+    crate::provider::tests::reset_issuing_test_provider();
+    let temp = TempDir::new().unwrap();
+    let primary = temp.path().join("primary.env");
+    let preferred = temp.path().join("preferred.env");
+    fs::write(&primary, "").unwrap();
+    fs::write(&preferred, "API_KEY=preferred\n").unwrap();
+
+    let chain = vec![
+        "primary".to_string(),
+        "preferred".to_string(),
+        "issuer".to_string(),
+    ];
+    let mut secrets = HashMap::new();
+    secrets.insert(
+        "API_KEY".to_string(),
+        Secret {
+            providers: Some(chain.clone()),
+            ..Default::default()
+        },
+    );
+    secrets.insert(
+        "DB_USERNAME".to_string(),
+        Secret {
+            providers: Some(chain),
+            reference: Some(crate::config::NativeAddress {
+                item: "database/roles/app".to_string(),
+                field: Some("username".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut config = resolve_test_config(secrets);
+    config.providers = Some(HashMap::from([
+        (
+            "primary".to_string(),
+            ProviderAlias::from(format!("dotenv://{}", primary.display())),
+        ),
+        (
+            "preferred".to_string(),
+            ProviderAlias::from(format!("dotenv://{}", preferred.display())),
+        ),
+        ("issuer".to_string(), ProviderAlias::from("issuing-test://")),
+    ]));
+
+    let spec = Secrets::new(config, None, None, None);
+    let report = spec.report().unwrap();
+    let api_report = report
+        .secrets
+        .iter()
+        .find(|secret| secret.name == "API_KEY")
+        .unwrap();
+    assert!(
+        api_report
+            .source_provider
+            .as_deref()
+            .is_some_and(|uri| uri.ends_with(preferred.to_string_lossy().as_ref())),
+        "API_KEY must be attributed to the preferred dotenv fallback"
+    );
+    assert!(
+        report
+            .secrets
+            .iter()
+            .find(|secret| secret.name == "DB_USERNAME")
+            .unwrap()
+            .issuable
+    );
+    assert_eq!(crate::provider::tests::issuing_test_counts(), (0, 1));
+
+    let resolved = spec.resolve().unwrap();
+    assert_eq!(
+        resolved.secrets["API_KEY"].value.as_deref().unwrap(),
+        "preferred",
+        "DB_USERNAME's unsupported dotenv field must not push API_KEY past its preferred fallback"
+    );
+    assert_eq!(
+        resolved.secrets["DB_USERNAME"].value.as_deref().unwrap(),
+        "user-1"
+    );
+    assert_eq!(crate::provider::tests::issuing_test_counts(), (1, 1));
+}
+
+#[test]
+fn a_fallback_read_error_does_not_change_a_sibling_secret_precedence() {
+    let _env = scrub_resolution_env();
+    let temp = TempDir::new().unwrap();
+    let primary = temp.path().join("primary.env");
+    let lower = temp.path().join("lower.env");
+    fs::write(&primary, "").unwrap();
+    fs::write(&lower, "API_KEY=lower\nBROKEN=recovered\n").unwrap();
+
+    let chain = vec![
+        "primary".to_string(),
+        "preferred".to_string(),
+        "lower".to_string(),
+    ];
+    let mut config = resolve_test_config(HashMap::from([
+        (
+            "API_KEY".to_string(),
+            Secret {
+                providers: Some(chain.clone()),
+                ..Default::default()
+            },
+        ),
+        (
+            "BROKEN".to_string(),
+            Secret {
+                providers: Some(chain),
+                ..Default::default()
+            },
+        ),
+    ]));
+    config.providers = Some(HashMap::from([
+        (
+            "primary".to_string(),
+            ProviderAlias::from(format!("dotenv://{}", primary.display())),
+        ),
+        (
+            "preferred".to_string(),
+            ProviderAlias::from("partial-read-test://"),
+        ),
+        (
+            "lower".to_string(),
+            ProviderAlias::from(format!("dotenv://{}", lower.display())),
+        ),
+    ]));
+
+    let resolved = Secrets::new(config, None, None, None).resolve().unwrap();
+    assert_eq!(
+        resolved.secrets["API_KEY"].value.as_deref(),
+        Some("preferred"),
+        "BROKEN's read failure must not push API_KEY to the lower fallback"
+    );
+    assert_eq!(
+        resolved.secrets["BROKEN"].value.as_deref(),
+        Some("recovered")
+    );
+}
+
+#[test]
+fn an_invalid_issued_field_fails_before_any_resource_is_minted() {
+    let _guard = ISSUING_TEST_GUARD.lock().unwrap();
+    crate::provider::tests::reset_issuing_test_provider();
+
+    let mut config = issuing_credentials_config("database");
+    config.profiles.get_mut("default").unwrap().secrets.insert(
+        "DB_PASSWORD".to_string(),
+        issuing_secret("not-a-database-field", "database"),
+    );
+    config.providers = Some(HashMap::from([(
+        "database".to_string(),
+        ProviderAlias::from("issuing-test://"),
+    )]));
+
+    let error = Secrets::new(config, None, None, None)
+        .resolve()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not provide field 'not-a-database-field'"),
+        "{error}"
+    );
+    assert_eq!(crate::provider::tests::issuing_test_counts(), (0, 0));
+}
+
+#[test]
+fn issued_values_are_not_written_to_provider_caches() {
+    let _guard = ISSUING_TEST_GUARD.lock().unwrap();
+    crate::provider::tests::reset_issuing_test_provider();
+    let temp = TempDir::new().unwrap();
+    let cache = temp.path().join("dynamic-cache.env");
+
+    let mut config = issuing_credentials_config("cached_database");
+    config.providers = Some(HashMap::from([
+        (
+            "database".to_string(),
+            ProviderAlias::from("issuing-test://"),
+        ),
+        (
+            "local".to_string(),
+            ProviderAlias::from(format!("dotenv://{}", cache.display())),
+        ),
+        (
+            "cached_database".to_string(),
+            ProviderAlias::cached(
+                vec!["database".to_string()],
+                ProviderCache::new("local", "5m").unwrap(),
+            )
+            .unwrap(),
+        ),
+    ]));
+    let secrets = Secrets::new(config, None, None, None);
+
+    let first = secrets.resolve().unwrap();
+    let second = secrets.resolve().unwrap();
+    assert_eq!(
+        first.secrets["DB_USERNAME"].value.as_deref(),
+        Some("user-1")
+    );
+    assert_eq!(
+        second.secrets["DB_USERNAME"].value.as_deref(),
+        Some("user-2"),
+        "a second resolution must issue again instead of serving a copied value"
+    );
+    assert_eq!(crate::provider::tests::issuing_test_counts(), (2, 0));
+    assert!(
+        !cache.exists() || fs::read_to_string(cache).unwrap().trim().is_empty(),
+        "issued credentials must not be persisted in the configured cache"
+    );
+}
+
 /// Serializes tests that scrub the `SECRETSPEC_*` process environment. The
 /// environment is shared across all test threads, so scrub/restore pairs must
 /// not interleave.

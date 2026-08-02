@@ -157,6 +157,7 @@ class SecretReport {
     this.status = entry.status;
     this.required = entry.required ?? false;
     this.sourceProvider = entry.source_provider ?? null;
+    this.issuable = entry.issuable ?? false;
     this.defaultApplied = entry.default_applied ?? false;
     this.generated = entry.generated ?? false;
     this.asPath = entry.as_path ?? false;

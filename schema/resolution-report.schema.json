@@ -84,6 +84,10 @@
           "description": "Credential-free URI of the provider that answered. Present only when the value came from a provider (absent when generated, defaulted, or missing).",
           "type": "string"
         },
+        "issuable": {
+          "description": "Whether a value-free probe established that the provider can issue this value on a materializing resolution. Added in SecretSpec 0.18 and omitted when false.",
+          "type": "boolean"
+        },
         "default_applied": {
           "description": "Whether the value came from the manifest's committed default.",
           "type": "boolean"

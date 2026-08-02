@@ -36,7 +36,7 @@ what the app needs  →    resolve · check · deliver    ←    provider-backed
 | Encryption at rest | Delegates protection of provider-backed values to the selected provider | Protect values when the backend supports encryption; dotenv and environment providers add no at-rest encryption |
 | Identity and access policy | Uses the credentials available for the selected provider, including [credentials sourced from another provider](/concepts/providers/#provider-credentials) | Enforce users, roles, service identities, policies, and sharing |
 | Availability and retention | Delegates these guarantees for provider-backed values | May provide synchronization, replication, versions, backup, or retention, depending on the provider |
-| Dynamic secrets and credential rotation | [Roadmap](https://github.com/cachix/secretspec/issues/11); not currently available and has no assigned target release | Provide native lifecycle features where available; use them outside SecretSpec today |
+| Dynamically issued secrets and credential rotation | The provider-neutral, one-shot issued-resource foundation proposed in [issue #11](https://github.com/cachix/secretspec/issues/11) is planned for 0.18; no bundled provider uses it yet. Public refresh streams, background renewal, process signaling or restart, and lease persistence remain roadmap work | Issue and revoke credentials, enforce leases, and expose provider-native lifecycle capabilities |
 
 The distinction is intentional: SecretSpec provides portable application
 semantics, while each provider determines how its provider-backed values are

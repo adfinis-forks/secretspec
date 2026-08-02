@@ -261,6 +261,7 @@ final class SecretSpecTests: XCTestCase {
                 "generated": secret.generated,
                 "default_applied": secret.defaultApplied,
                 "source_provider": secret.sourceProvider != nil,
+                "issuable": secret.issuable,
             ]
             secrets[secret.name] = canonicalSecret
         }

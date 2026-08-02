@@ -259,6 +259,7 @@ internal static class Program
                 ["generated"] = secret.Generated,
                 ["default_applied"] = secret.DefaultApplied,
                 ["source_provider"] = secret.SourceProvider is not null,
+                ["issuable"] = secret.Issuable,
             };
         }
 

@@ -291,6 +291,7 @@ canonicalReport rep =
                 , -- Present-or-not (not the path-dependent value) so the vector
                   -- is machine-independent yet still catches a dropped provider.
                   "source_provider" .= isJust (S.srSourceProvider s)
+                , "issuable" .= S.srIssuable s
                 ]
           | s <- S.reportSecrets rep
           ]

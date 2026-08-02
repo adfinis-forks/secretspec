@@ -50,6 +50,8 @@ export class SecretReport {
   status: string;
   required: boolean;
   sourceProvider: string | null;
+  /** Provider verified it can issue this value without report-time materialization (0.18+). */
+  issuable: boolean;
   defaultApplied: boolean;
   generated: boolean;
   asPath: boolean;

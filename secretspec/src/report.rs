@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 /// additive-and-optional, and update `schema/resolution-report.schema.json`.
 pub const RESOLUTION_REPORT_SCHEMA_VERSION: u32 = 1;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// How a single declared secret resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +55,11 @@ pub struct SecretResolution {
     /// value came from a provider. `None` when generated, defaulted, or missing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_provider: Option<String>,
+    /// Whether a value-free probe established that the provider can issue the
+    /// value on a materializing resolution. Available since SecretSpec 0.18.
+    /// Omitted when false so the report v1 change remains additive.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub issuable: bool,
     /// Whether the value came from the manifest's committed `default`.
     pub default_applied: bool,
     /// Whether the value was freshly minted by the secret's `generate` config.
@@ -140,7 +149,12 @@ impl ResolutionReport {
                 ResolutionStatus::Resolved => {
                     // Same provenance order as `resolve_impl`'s `ResolvedSource`
                     // mapping; the flags are mutually exclusive.
-                    if s.generated {
+                    if s.issuable {
+                        s.source_provider.as_ref().map_or_else(
+                            || "ok        issuable".to_string(),
+                            |uri| format!("ok        issuable by {uri}"),
+                        )
+                    } else if s.generated {
                         "ok        generated".to_string()
                     } else if s.default_applied {
                         "ok        default value".to_string()
@@ -186,6 +200,7 @@ mod tests {
                     status: ResolutionStatus::MissingRequired,
                     required: true,
                     source_provider: None,
+                    issuable: false,
                     default_applied: false,
                     generated: false,
                     composed: false,
@@ -196,6 +211,7 @@ mod tests {
                     status: ResolutionStatus::Resolved,
                     required: true,
                     source_provider: Some("keyring://".to_string()),
+                    issuable: false,
                     default_applied: false,
                     generated: false,
                     composed: false,
@@ -206,6 +222,7 @@ mod tests {
                     status: ResolutionStatus::Resolved,
                     required: true,
                     source_provider: None,
+                    issuable: false,
                     default_applied: false,
                     generated: true,
                     composed: false,
@@ -216,6 +233,7 @@ mod tests {
                     status: ResolutionStatus::Resolved,
                     required: false,
                     source_provider: None,
+                    issuable: false,
                     default_applied: true,
                     generated: false,
                     composed: false,
@@ -226,6 +244,7 @@ mod tests {
                     status: ResolutionStatus::MissingOptional,
                     required: false,
                     source_provider: None,
+                    issuable: false,
                     default_applied: false,
                     generated: false,
                     composed: false,
@@ -287,6 +306,7 @@ mod tests {
                 status: ResolutionStatus::Resolved,
                 required: true,
                 source_provider: None,
+                issuable: false,
                 default_applied: false,
                 generated: false,
                 composed: false,

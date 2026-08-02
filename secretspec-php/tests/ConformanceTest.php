@@ -101,6 +101,7 @@ final class ConformanceTest extends TestCase
                 // Present-or-not (not the path-dependent value) so the vector is
                 // machine-independent yet still catches a dropped source_provider.
                 'source_provider' => $s->sourceProvider !== null,
+                'issuable' => $s->issuable,
             ];
         }
 

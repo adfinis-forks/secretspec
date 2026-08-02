@@ -135,6 +135,10 @@ public sealed class SecretReport
     [JsonPropertyName("source_provider")]
     public string? SourceProvider { get; init; }
 
+    /// <summary>Provider can issue the value without report-time materialization (0.18+).</summary>
+    [JsonPropertyName("issuable")]
+    public bool Issuable { get; init; }
+
     [JsonPropertyName("default_applied")]
     public bool DefaultApplied { get; init; }
 

@@ -130,6 +130,7 @@ final class Builder
                 $s['status'],
                 $s['required'],
                 $s['source_provider'] ?? null,
+                $s['issuable'] ?? false,
                 $s['default_applied'],
                 $s['generated'],
                 $s['as_path'],

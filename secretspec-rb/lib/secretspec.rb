@@ -90,9 +90,9 @@ module Secretspec
   end
 
   # Value-free resolution outcome for one declared secret: how it would resolve
-  # and from where, never the value itself.
+  # and from where, never the value itself. +issuable+ is available in 0.18+.
   SecretReport = Struct.new(:name, :status, :required, :source_provider,
-                            :default_applied, :generated, :as_path)
+                            :issuable, :default_applied, :generated, :as_path)
 
   # A value-free resolution snapshot. Unlike Resolved, a missing required secret
   # is a "missing_required" status here, not an error, so a report describes a
@@ -205,7 +205,8 @@ module Secretspec
 
       secrets = (response["secrets"] || []).map do |s|
         SecretReport.new(s["name"], s["status"], s["required"],
-                         s["source_provider"], s["default_applied"],
+                         s["source_provider"], s.fetch("issuable", false),
+                         s["default_applied"],
                          s["generated"], s["as_path"])
       end
       Report.new(response["provider"], response["profile"], secrets, response["scope"])

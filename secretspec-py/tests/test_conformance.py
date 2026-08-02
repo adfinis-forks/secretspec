@@ -43,6 +43,7 @@ def _canonical_report(report) -> dict:
                 # Present-or-not (not the path-dependent value) so the vector is
                 # machine-independent yet still catches a dropped source_provider.
                 "source_provider": s.source_provider is not None,
+                "issuable": s.issuable,
             }
             for s in report.secrets
         },

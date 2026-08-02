@@ -1,11 +1,14 @@
 use crate::Result;
-use crate::provider::{Address, Provider};
+use crate::provider::{
+    Address, Provider, ProviderAvailability, ProviderBatch, ProviderProbe, ProviderResource,
+    ProviderResourceLifecycle,
+};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[cfg(test)]
 use tempfile::TempDir;
@@ -204,6 +207,251 @@ impl Provider for MemTestProvider {
 
     fn uri(&self) -> String {
         "memtest://".to_string()
+    }
+}
+
+static ISSUING_TEST_ISSUES: AtomicUsize = AtomicUsize::new(0);
+static ISSUING_TEST_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn reset_issuing_test_provider() {
+    ISSUING_TEST_ISSUES.store(0, Ordering::SeqCst);
+    ISSUING_TEST_PROBES.store(0, Ordering::SeqCst);
+}
+
+pub(crate) fn issuing_test_counts() -> (usize, usize) {
+    (
+        ISSUING_TEST_ISSUES.load(Ordering::SeqCst),
+        ISSUING_TEST_PROBES.load(Ordering::SeqCst),
+    )
+}
+
+/// Test-only provider that models a database credentials endpoint: fields of
+/// the same `item` are minted in one operation and share one lease.
+pub(crate) struct IssuingTestProvider;
+pub(crate) struct IssuingTestConfig;
+
+impl TryFrom<&super::ProviderUrl> for IssuingTestConfig {
+    type Error = crate::SecretSpecError;
+
+    fn try_from(_url: &super::ProviderUrl) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+impl IssuingTestProvider {
+    fn new(_config: IssuingTestConfig) -> Self {
+        Self
+    }
+
+    fn grouped_requests(
+        &self,
+        requests: &[(&str, Address<'_>)],
+    ) -> Result<HashMap<String, Vec<(String, String)>>> {
+        let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (name, addr) in requests {
+            let coords = self.resolve_coords(*addr)?;
+            let field = coords.field.as_deref().ok_or_else(|| {
+                crate::SecretSpecError::ProviderOperationFailed(
+                    "issuing-test references require a `field` coordinate".to_string(),
+                )
+            })?;
+            if !matches!(field, "username" | "password") {
+                return Err(crate::SecretSpecError::ProviderOperationFailed(format!(
+                    "issuing-test does not provide field '{field}'"
+                )));
+            }
+            groups
+                .entry(coords.item.clone())
+                .or_default()
+                .push(((*name).to_string(), field.to_string()));
+        }
+        Ok(groups)
+    }
+}
+
+crate::register_provider! {
+    struct: IssuingTestProvider,
+    config: IssuingTestConfig,
+    name: "issuing-test",
+    description: "Dynamic credential provider for tests",
+    schemes: ["issuing-test"],
+    examples: ["issuing-test://"],
+}
+
+impl Provider for IssuingTestProvider {
+    fn convention_address(
+        &self,
+        project: &str,
+        profile: &str,
+        key: &str,
+    ) -> Result<crate::config::NativeAddress> {
+        Ok(crate::config::NativeAddress {
+            item: format!("{project}/{profile}/{key}"),
+            ..Default::default()
+        })
+    }
+
+    fn supported_coords(&self) -> &'static [&'static str] {
+        &["field"]
+    }
+
+    fn issuance_group(&self, addr: Address<'_>) -> Result<Option<String>> {
+        let coords = self.resolve_coords(addr)?;
+        Ok(Some(coords.item.clone()))
+    }
+
+    fn validate_address(&self, addr: Address<'_>) -> Result<()> {
+        let coords = self.resolve_coords(addr)?;
+        let field = coords.field.as_deref().ok_or_else(|| {
+            crate::SecretSpecError::ProviderOperationFailed(
+                "issuing-test references require a `field` coordinate".to_string(),
+            )
+        })?;
+        if !matches!(field, "username" | "password") {
+            return Err(crate::SecretSpecError::ProviderOperationFailed(format!(
+                "issuing-test does not provide field '{field}'"
+            )));
+        }
+        Ok(())
+    }
+
+    fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
+        Ok(self
+            .fetch_many(&[("value", addr)])?
+            .into_values()
+            .remove("value"))
+    }
+
+    fn set(&self, _addr: Address<'_>, _value: &SecretString) -> Result<()> {
+        Err(crate::SecretSpecError::ProviderOperationFailed(
+            "issuing-test is read-only".to_string(),
+        ))
+    }
+
+    fn check_writable(&self, _addr: Address<'_>) -> Result<()> {
+        Err(crate::SecretSpecError::ProviderOperationFailed(
+            "issuing-test is read-only".to_string(),
+        ))
+    }
+
+    fn name(&self) -> &'static str {
+        Self::PROVIDER_NAME
+    }
+
+    fn uri(&self) -> String {
+        "issuing-test://".to_string()
+    }
+
+    fn fetch_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderBatch> {
+        // Resolve and validate every requested field before minting anything.
+        // An invalid field therefore fails the entire batch without incrementing
+        // the issue counter or exposing half a credential pair.
+        let groups = self.grouped_requests(requests)?;
+        let mut values = HashMap::new();
+        let mut resources = Vec::new();
+        for group in groups.into_values() {
+            let generation = ISSUING_TEST_ISSUES.fetch_add(1, Ordering::SeqCst) + 1;
+            let members: Vec<String> = group.iter().map(|(name, _)| name.clone()).collect();
+            for (name, field) in group {
+                let value = match field.as_str() {
+                    "username" => format!("user-{generation}"),
+                    "password" => format!("password-{generation}"),
+                    _ => unreachable!("fields were validated before issuance"),
+                };
+                values.insert(name, SecretString::new(value.into()));
+            }
+            resources.push(ProviderResource::new(
+                members,
+                ProviderResourceLifecycle::Leased {
+                    expires_at: SystemTime::now() + Duration::from_secs(300),
+                    renewable: false,
+                },
+            )?);
+        }
+        ProviderBatch::new(values, resources)
+    }
+
+    fn probe_many(&self, requests: &[(&str, Address<'_>)]) -> Result<ProviderProbe> {
+        self.grouped_requests(requests)?;
+        ISSUING_TEST_PROBES.fetch_add(1, Ordering::SeqCst);
+        Ok(ProviderProbe::new(
+            requests
+                .iter()
+                .map(|(name, _)| ((*name).to_string(), ProviderAvailability::Issuable))
+                .collect(),
+        ))
+    }
+}
+
+/// Stored-value provider whose reads fail for one address, used to prove that
+/// batch fallback errors do not change unrelated secrets' precedence.
+pub(crate) struct PartialReadTestProvider;
+pub(crate) struct PartialReadTestConfig;
+
+impl TryFrom<&super::ProviderUrl> for PartialReadTestConfig {
+    type Error = crate::SecretSpecError;
+
+    fn try_from(_url: &super::ProviderUrl) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+impl PartialReadTestProvider {
+    fn new(_config: PartialReadTestConfig) -> Self {
+        Self
+    }
+}
+
+crate::register_provider! {
+    struct: PartialReadTestProvider,
+    config: PartialReadTestConfig,
+    name: "partial-read-test",
+    description: "Address-specific read failure provider for tests",
+    schemes: ["partial-read-test"],
+    examples: ["partial-read-test://"],
+}
+
+impl Provider for PartialReadTestProvider {
+    fn convention_address(
+        &self,
+        _project: &str,
+        _profile: &str,
+        key: &str,
+    ) -> Result<crate::config::NativeAddress> {
+        Ok(crate::config::NativeAddress {
+            item: key.to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn get(&self, addr: Address<'_>) -> Result<Option<SecretString>> {
+        match super::flat_item(self, addr)?.as_ref() {
+            "BROKEN" => Err(crate::SecretSpecError::ProviderOperationFailed(
+                "BROKEN has an address-specific read failure".to_string(),
+            )),
+            "API_KEY" => Ok(Some(SecretString::new("preferred".into()))),
+            _ => Ok(None),
+        }
+    }
+
+    fn set(&self, _addr: Address<'_>, _value: &SecretString) -> Result<()> {
+        Err(crate::SecretSpecError::ProviderOperationFailed(
+            "partial-read-test is read-only".to_string(),
+        ))
+    }
+
+    fn check_writable(&self, _addr: Address<'_>) -> Result<()> {
+        Err(crate::SecretSpecError::ProviderOperationFailed(
+            "partial-read-test is read-only".to_string(),
+        ))
+    }
+
+    fn name(&self) -> &'static str {
+        Self::PROVIDER_NAME
+    }
+
+    fn uri(&self) -> String {
+        "partial-read-test://".to_string()
     }
 }
 
@@ -610,6 +858,47 @@ fn get_each_respects_concurrency_cap() {
         "expected some concurrency, peak={}",
         p.peak()
     );
+}
+
+#[test]
+fn issued_resource_rejects_empty_and_duplicate_members() {
+    let lifecycle = ProviderResourceLifecycle::Expiring {
+        expires_at: SystemTime::UNIX_EPOCH,
+    };
+    assert!(ProviderResource::new(Vec::<String>::new(), lifecycle).is_err());
+    let error = ProviderResource::new(["TOKEN", "TOKEN"], lifecycle).unwrap_err();
+    assert!(error.to_string().contains("duplicate secret 'TOKEN'"));
+}
+
+#[test]
+fn provider_batch_rejects_incomplete_or_overlapping_resources() {
+    let lifecycle = ProviderResourceLifecycle::Leased {
+        expires_at: SystemTime::UNIX_EPOCH,
+        renewable: true,
+    };
+    let missing = ProviderResource::new(["PASSWORD"], lifecycle).unwrap();
+    let error = ProviderBatch::new(HashMap::new(), vec![missing]).unwrap_err();
+    assert!(error.to_string().contains("missing value for 'PASSWORD'"));
+
+    let values = HashMap::from([("TOKEN".to_string(), SecretString::new("value".into()))]);
+    let first = ProviderResource::new(["TOKEN"], lifecycle).unwrap();
+    let second = ProviderResource::new(["TOKEN"], lifecycle).unwrap();
+    let error = ProviderBatch::new(values, vec![first, second]).unwrap_err();
+    assert!(error.to_string().contains("more than one issued"));
+}
+
+#[test]
+fn provider_results_cannot_smuggle_unrequested_names() {
+    let requests = [(
+        "REQUESTED",
+        Address::convention("project", "default", "key"),
+    )];
+    let values = HashMap::from([("UNREQUESTED".to_string(), SecretString::new("value".into()))]);
+    let batch = ProviderBatch::stored(values);
+    assert!(batch.validate_requests(&requests).is_err());
+
+    let probe = ProviderProbe::present(["UNREQUESTED"]);
+    assert!(probe.validate_requests(&requests).is_err());
 }
 
 #[test]

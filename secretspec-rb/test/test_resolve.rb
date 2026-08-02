@@ -190,7 +190,8 @@ class ConformanceTest < Minitest::Test
         "default_applied" => s.default_applied,
         # Present-or-not (not the path-dependent value) so the vector is
         # machine-independent yet still catches a dropped source_provider.
-        "source_provider" => !s.source_provider.nil?
+        "source_provider" => !s.source_provider.nil?,
+        "issuable" => s.issuable
       }
     end
     { "profile" => report.profile, "secrets" => secrets }

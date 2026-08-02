@@ -306,6 +306,8 @@ type SecretReport struct {
 	Status         string // "resolved" | "missing_required" | "missing_optional"
 	Required       bool
 	SourceProvider *string
+	// Issuable means the provider verified it can issue the value without report-time materialization (0.18+).
+	Issuable       bool
 	DefaultApplied bool
 	Generated      bool
 	AsPath         bool
@@ -328,6 +330,7 @@ type secretReportJSON struct {
 	Status         string  `json:"status"`
 	Required       bool    `json:"required"`
 	SourceProvider *string `json:"source_provider"`
+	Issuable       bool    `json:"issuable"`
 	DefaultApplied bool    `json:"default_applied"`
 	Generated      bool    `json:"generated"`
 	AsPath         bool    `json:"as_path"`

@@ -139,6 +139,7 @@ data SecretReport = SecretReport
   , srStatus         :: Text -- ^ @"resolved"@, @"missing_required"@, or @"missing_optional"@.
   , srRequired       :: Bool
   , srSourceProvider :: Maybe Text
+  , srIssuable       :: Bool -- ^ Provider can issue without report-time materialization (0.18+).
   , srDefaultApplied :: Bool
   , srGenerated      :: Bool
   , srAsPath         :: Bool
@@ -151,6 +152,7 @@ instance FromJSON SecretReport where
       <*> o .: "status"
       <*> o .:? "required" .!= False
       <*> o .:? "source_provider"
+      <*> o .:? "issuable" .!= False
       <*> o .:? "default_applied" .!= False
       <*> o .:? "generated" .!= False
       <*> o .:? "as_path" .!= False

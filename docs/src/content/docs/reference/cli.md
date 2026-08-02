@@ -226,6 +226,11 @@ generator (`generated`), or a committed default (`default_applied`), and whether
 it is exposed `as_path`. No secret values appear. The canonical JSON Schema is
 committed at `schema/resolution-report.schema.json`.
 
+Starting in SecretSpec 0.18, a dynamic provider can additionally report
+`issuable: true`. This means the provider verified that it can issue the value
+without creating it during the value-free report. The same flag is available on
+the SecretSpec 0.18 report model in every supported SDK.
+
 ```bash
 $ secretspec check --profile production --json
 {

@@ -38,6 +38,25 @@ pub trait Provider: Send + Sync {
     /// store has a real bulk surface (one listing, a batch API).
     fn get_many(&self, requests: &[(&str, Address<'_>)])
         -> Result<HashMap<String, SecretString>> { /* default */ }
+
+    /// Classify fields that one dynamic operation issues together (0.18+).
+    /// Stored providers keep the `None` default.
+    fn issuance_group(&self, addr: Address<'_>)
+        -> Result<Option<String>> { /* stored-value default */ }
+
+    /// Validate an address without contacting the backend (0.18+).
+    fn validate_address(&self, addr: Address<'_>)
+        -> Result<()> { /* coordinate-validation default */ }
+
+    /// Optional materializing batch for dynamic providers (0.18+). Attach all
+    /// fields minted together to one ProviderResource.
+    fn fetch_many(&self, requests: &[(&str, Address<'_>)])
+        -> Result<ProviderBatch> { /* stored-value default */ }
+
+    /// Optional value-free capability probe (0.18+). A provider whose reads
+    /// issue values must override this without minting them.
+    fn probe_many(&self, requests: &[(&str, Address<'_>)])
+        -> Result<ProviderProbe> { /* stored-value default */ }
 }
 ```
 
@@ -48,6 +67,33 @@ written for another store fails loudly instead of resolving something else —
 you declare the set, you never write the check. Have `set` call
 `self.check_writable(addr)?` first, so the pre-check and the write agree on
 one refusal message.
+
+### Dynamically issued resources (0.18+)
+
+Use `fetch_many` when one backend operation issues one or more related values,
+such as a database username and password. Return those names in one
+`ProviderResource` with their expiry or lease metadata. Also override
+`issuance_group` with a stable, credential-free identity shared by fields that
+must be issued together, and put any field-level checks in `validate_address`.
+SecretSpec validates every member before calling the group, treats the resource
+as atomic, and does not copy its values into a configured provider cache.
+
+The group is preserved when the provider is reached through an ordered fallback
+chain. Failures are isolated at that boundary: an invalid ordinary stored-secret
+address cannot push unrelated names to a lower fallback, while one invalid
+member of an issued resource prevents every member of that resource from being
+minted by that provider.
+
+Also override `probe_many` with a non-issuing permissions or capability check.
+Value-free resolution (`check --json`, `check --explain`, reports, and SDK
+no-values requests) calls this path; reports mark the names `issuable`. The
+probe must not create a credential merely to say that one could be created.
+Every SDK's report model exposes this flag as `issuable` (or its language-style
+equivalent), defaulting to `false` when reading pre-0.18 report payloads.
+In 0.18, lifecycle metadata remains on the provider resource during one-shot
+resolution; the public async refresh stream proposed in issue #11 is not yet
+implemented. Renewal, background refresh, lease persistence, process signaling,
+and restart are intentionally outside this provider contract.
 
 ## Implementation Steps
 

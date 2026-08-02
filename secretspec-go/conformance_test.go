@@ -157,6 +157,7 @@ func canonicalReport(report *Report) map[string]any {
 			// Present-or-not (not the path-dependent value) so the vector is
 			// machine-independent yet still catches a dropped source_provider.
 			"source_provider": s.SourceProvider != nil,
+			"issuable":        s.Issuable,
 		}
 	}
 	return map[string]any{"profile": report.Profile, "secrets": secrets}
